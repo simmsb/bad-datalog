@@ -1,0 +1,16 @@
+* Notes
+
+- clauses of [?e :attr ?a] can be turned into getting :attr from the
+  final result at the correct column
+
+so given the schema is (attr, relation)
+
+So if we have [?e :attr ?a], [?e2 :attr ?b], [?e :relation ?e2]
+and we're selecting out [?a ?b]
+each left-hand side is it's own select from the table, 
+so say: ?e is row 0, ?e2 is row 1.
+if a left-hand side is used on a right-hand side then
+we end up with performing an outer join over the database
+resulting in rows of (0.id, 0.attr, 0.relation, 1.id, 1.attr, 1.relation)
+filtered where (0.relation == 1.id)
+and then from this we take out (0.attr, 1.attr)
