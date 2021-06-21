@@ -11,5 +11,6 @@ resolver = "2"
 bincode = "1.3.3"
 btreemultimap = "0.1.0"
 byteorder = "1.4.3"
-serde = "1.0.126"
+itertools = "0.10.1"
+serde = { version = "1.0.126", features = ["rc"] }
 sled = "0.34.6"
