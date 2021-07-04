@@ -1,26 +1,32 @@
+#![warn(clippy::all)]
+
 use std::rc::Rc;
 
-use dlog::*;
+use dlog::{
+    datalog::*,
+    query::{QueryBuilder, RHS},
+};
+use itertools::Itertools;
 
 fn books() {
-    let book_names = Relation::<Rc<String>>::from_iter([
+    let book_names = EphemerealRelation::<Rc<String>>::from_iter([
         (100, "foo".to_owned().into()),
         (101, "bar".to_owned().into()),
         (102, "baz".to_owned().into()),
         (103, "blah".to_owned().into()),
     ]);
 
-    let review_users = Relation::<Rc<String>>::from_iter([
+    let review_users = EphemerealRelation::<Rc<String>>::from_iter([
         (0, "reviewer_0".to_owned().into()),
         (1, "reviewer_1".to_owned().into()),
         (2, "reviewer_0".to_owned().into()),
         (3, "reviewer_1".to_owned().into()),
     ]);
 
-    let review_scores = Relation::<u64>::from_iter([(0, 22), (1, 44), (2, 12), (3, 6)]);
+    let review_scores = EphemerealRelation::<u64>::from_iter([(0, 22), (1, 44), (2, 12), (3, 6)]);
 
     // review --> book
-    let review_books = Relation::<u64>::from_iter([(0, 100), (1, 100), (2, 101), (3, 103)]);
+    let review_books = EphemerealRelation::<u64>::from_iter([(0, 100), (1, 100), (2, 101), (3, 103)]);
 
     // let's do the query:
     //   ?b :book_name ?t
@@ -82,7 +88,7 @@ fn from_join_ex() {
     v1.insert_data([(1, 0), (2, 1)]);
 
     while any_changed([v1.as_dyn()]) {
-        v1.from_join(&v1, &v1, |k, &a, &b| (a, b));
+        v1.from_join(&v1, &v1, |_k, &a, &b| (a, b));
     }
 
     let r = v1.into_relation();
@@ -92,8 +98,50 @@ fn from_join_ex() {
     }
 }
 
+fn test_query() {
+    let mut builder = QueryBuilder::default();
+
+    let b = builder.binding();
+    let p = builder.binding();
+    let t = builder.binding();
+    let r = builder.binding();
+    let u = builder.binding();
+    let s = builder.binding();
+
+    builder
+        .pattern(b, "book_name", RHS::Bnd(t))
+        .pattern(b, "book_price", RHS::Bnd(p))
+        .pattern(r, "review_book", RHS::Bnd(b))
+        .pattern(r, "review_user", RHS::Bnd(u))
+        .pattern(r, "review_score", RHS::Bnd(s));
+
+    let plan = builder.plan();
+
+    println!("bindings: ");
+
+    for (binding, meta) in &plan.binding_metas {
+        println!("{:?}: {:?}", binding, meta);
+    }
+
+    println!("\nvariables: ");
+
+    for (vid, meta) in plan.var_metas.iter().sorted_by_key(|(k, _v)| *k) {
+        println!("{}: {:?}", vid, meta);
+    }
+
+    println!("\nopcodes: ");
+
+    for (attr, vid) in &plan.inversions {
+        println!("{} <- {}", vid, attr);
+    }
+
+    for op in &plan.opcodes {
+        println!("{}", op);
+    }
+}
+
 fn main() {
-    for f in [books, from_join_ex] {
+    for f in [books, from_join_ex, test_query] {
         f()
     }
 }
