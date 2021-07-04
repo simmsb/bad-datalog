@@ -4,6 +4,7 @@ use itertools::Itertools;
 use std::{
     borrow::Cow,
     cell::{Ref, RefCell},
+    fmt::Debug,
     marker::PhantomData,
     ops::{Bound, Deref, RangeInclusive},
     rc::Rc,
@@ -33,13 +34,21 @@ pub trait Relation<T: Clone + 'static> {
         }
     }
 
-    fn iter<'a>(&'a self) -> Self::Iter<'a>;
+    fn iter(&self) -> Self::Iter<'_>;
     fn len(&self) -> usize;
 }
 
 pub struct DBBackedRelation<T> {
     elements: sled::Tree,
     _marker: PhantomData<fn() -> T>,
+}
+
+impl<T> Debug for DBBackedRelation<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DBBackedRelation")
+            .field("relation", &String::from_utf8_lossy(&self.elements.name()))
+            .finish()
+    }
 }
 
 impl<T> Relation<T> for DBBackedRelation<T>
@@ -92,7 +101,7 @@ where
 }
 
 impl<T> DBBackedRelation<T> {
-    pub(crate) fn from_tree<'a>(tree: sled::Tree) -> Self
+    pub(crate) fn from_tree(tree: sled::Tree) -> Self
     where
         T: serde::de::DeserializeOwned + PartialOrd,
     {
@@ -103,15 +112,18 @@ impl<T> DBBackedRelation<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct EphemerealRelation<T> {
     elements: BTreeMultiMap<u64, T>,
 }
 
+type EphemerealRelIter<'a, T> = std::iter::Map<
+    btreemultimap::MultiIter<'a, u64, T>,
+    for<'b> fn((&'b u64, &'b T)) -> (u64, Cow<'b, T>),
+>;
+
 impl<T: Clone + 'static> Relation<T> for EphemerealRelation<T> {
-    type Iter<'a> = std::iter::Map<
-        btreemultimap::MultiIter<'a, u64, T>,
-        for<'b> fn((&'b u64, &'b T)) -> (u64, Cow<'b, T>),
-    >;
+    type Iter<'a> = EphemerealRelIter<'a, T>;
 
     fn is_empty(&self) -> bool {
         self.elements.is_empty()
@@ -139,7 +151,7 @@ impl<T: Clone + 'static> Relation<T> for EphemerealRelation<T> {
         self.elements.get_vec(&idx).map(|x| OnceOrMany::Many(x))
     }
 
-    fn iter<'a>(&'a self) -> Self::Iter<'a> {
+    fn iter(&self) -> Self::Iter<'_> {
         fn inner<'a, T: Clone>((k, v): (&'a u64, &'a T)) -> (u64, Cow<'a, T>) {
             (*k, Cow::Borrowed(v))
         }
@@ -189,8 +201,8 @@ impl<'a, 'b: 'a, T> IntoIterator for &'b OnceOrMany<'a, T> {
 
     fn into_iter(self) -> Self::IntoIter {
         match self {
-            OnceOrMany::Once(o) => std::slice::from_ref(o).into_iter(),
-            OnceOrMany::Many(m) => m.into_iter(),
+            OnceOrMany::Once(o) => std::slice::from_ref(o).iter(),
+            OnceOrMany::Many(m) => m.iter(),
         }
     }
 }
@@ -282,7 +294,7 @@ impl<T> IntoIterator for EphemerealRelation<T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Variable<T> {
     stable: Rc<RefCell<Vec<EphemerealRelation<T>>>>,
     recent: Rc<RefCell<EphemerealRelation<T>>>,
