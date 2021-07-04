@@ -4,7 +4,7 @@ use itertools::Itertools;
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
-    datalog::{any_changed, DBBackedRelation, Variable, VariableMeta},
+    datalog::{any_changed, DBBackedRelation, Relation, Variable, VariableMeta},
     query::{Binding, QueryBuilder, QueryClause, RHS},
     storage::Value,
 };
@@ -145,6 +145,14 @@ impl QueryPlan {
 
                     self.var_for_attr(attr, lhs, *rhs_binding)
                 };
+
+                // TODO: we need to be aware of queries in the form:
+                //
+                // (?a :attr ?b)
+                // (?b :attr ?c)
+                //
+                // These don't join the ?b because it's used on the lhs *after*
+                // where it's used on the rhs
 
                 if let Some(previous_lhs_vid) = self.binding_metas.get(&lhs).unwrap().final_variable
                 {
@@ -396,8 +404,6 @@ impl QueryPlan {
         }
 
         while any_changed(vars.iter().map(|v| *v as &dyn VariableMeta)) {
-            println!("{:#?}", things);
-
             for op in &self.opcodes {
                 op.execute(&things);
             }
@@ -652,8 +658,6 @@ impl OpCode {
                 let lhs_thing = &things[*lhs];
                 let rhs_thing = &things[*rhs];
 
-                println!("performing join of {} <> {} into {}", lhs, rhs, dst);
-
                 // hmmmm
                 match (lhs_thing, rhs_thing) {
                     (VarOrRel::Var(lhs), VarOrRel::Var(rhs)) => {
@@ -699,15 +703,15 @@ impl OpCode {
                         });
                     }
                     (VarOrRel::Rel(lhs), VarOrRel::Var(rhs)) => {
-                        dst_var.from_join(lhs, rhs, |k, l, r| {
+                        dst_var.from_join(rhs, lhs, |k, l, r| {
                             let mut out_v =
                                 SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
                             out_v.resize_with(*out_len, MaybeUninit::uninit);
 
                             let mut out_k = MaybeUninit::<u64>::uninit();
 
-                            lhs_fetch_method.perform_on_scalar(l, &mut out_k, out_v.as_mut_slice());
-                            rhs_fetch_method.perform_on_row(r, &mut out_k, out_v.as_mut_slice());
+                            lhs_fetch_method.perform_on_scalar(r, &mut out_k, out_v.as_mut_slice());
+                            rhs_fetch_method.perform_on_row(l, &mut out_k, out_v.as_mut_slice());
                             key_fetch_method.perform(Value::U(k), &mut out_k, out_v.as_mut_slice());
 
                             let out_k = unsafe { out_k.assume_init() };
@@ -720,7 +724,7 @@ impl OpCode {
                         });
                     }
                     (VarOrRel::Rel(lhs), VarOrRel::Rel(rhs)) => {
-                        dst_var.from_join(lhs, rhs, |k, l, r| {
+                        dst_var.from_join_rel(lhs, rhs, |k, l, r| {
                             let mut out_v =
                                 SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
                             out_v.resize_with(*out_len, MaybeUninit::uninit);

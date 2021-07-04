@@ -333,17 +333,26 @@ impl<T: Clone + Ord + 'static> Variable<T> {
         self.insert(EphemerealRelation::from_iter(it))
     }
 
-    pub fn from_join<U, V, L, R, F, LR, RR>(&self, lhs: L, rhs: R, logic: F)
+    pub fn from_join<U, V, R, F, RR>(&self, lhs: &Variable<U>, rhs: R, logic: F)
     where
         U: Clone + Ord + 'static,
         V: Clone + 'static,
-        L: Joinable<U, LR> + Copy,
-        LR: Relation<U>,
         R: Joinable<V, RR> + Copy,
         RR: Relation<V>,
         F: FnMut(u64, &U, &V) -> (u64, T),
     {
         join_into(lhs, rhs, self, logic);
+    }
+
+    pub fn from_join_rel<U, V, L, R, F>(&self, lhs: &L, rhs: &R, logic: F)
+    where
+        U: Clone + Ord + 'static,
+        V: Clone + 'static,
+        L: Relation<U>,
+        R: Relation<V>,
+        F: FnMut(u64, &U, &V) -> (u64, T),
+    {
+        join_into_rel(lhs, rhs, self, logic);
     }
 
     pub fn from_map<U, F>(&self, input: &Variable<U>, mut logic: F)
@@ -487,17 +496,11 @@ where
     }
 }
 
-fn join_into<T, U, V, L, R, F, TR, RR>(
-    lhs: L, //&Variable<T>,
-    rhs: R,
-    out: &Variable<V>,
-    mut logic: F,
-) where
+fn join_into<T, U, V, R, F, RR>(lhs: &Variable<T>, rhs: R, out: &Variable<V>, mut logic: F)
+where
     T: Clone + Ord + 'static,
     U: Clone + 'static,
     V: Clone + Ord + 'static,
-    L: Joinable<T, TR> + Copy,
-    TR: Relation<T>,
     R: Joinable<U, RR> + Copy,
     RR: Relation<U>,
     F: FnMut(u64, &T, &U) -> (u64, V),
@@ -525,6 +528,24 @@ fn join_into<T, U, V, L, R, F, TR, RR>(
             results.push(logic(k, l, r));
         });
     }
+
+    out.insert(EphemerealRelation::from_iter(results));
+}
+
+fn join_into_rel<T, U, V, L, R, F>(lhs: &L, rhs: &R, out: &Variable<V>, mut logic: F)
+where
+    T: Clone + Ord + 'static,
+    U: Clone + 'static,
+    V: Clone + Ord + 'static,
+    L: Relation<T>,
+    R: Relation<U>,
+    F: FnMut(u64, &T, &U) -> (u64, V),
+{
+    let mut results = Vec::new();
+
+    join_helper(lhs, rhs, |k, l, r| {
+        results.push(logic(k, l, r));
+    });
 
     out.insert(EphemerealRelation::from_iter(results));
 }
