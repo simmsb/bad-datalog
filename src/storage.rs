@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{fmt::Display, rc::Rc};
 
 use serde::{Deserialize, Serialize};
 use sled::Db;
@@ -44,6 +44,16 @@ pub enum Value {
     U(u64),
 }
 
+impl Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::S(s) => write!(f, "{}", s),
+            Value::I(i) => write!(f, "{}", i),
+            Value::U(u) => write!(f, "{}", u),
+        }
+    }
+}
+
 impl Value {
     pub fn u(self) -> Option<u64> {
         match self {
@@ -74,6 +84,18 @@ impl From<i64> for Value {
 impl From<u64> for Value {
     fn from(v: u64) -> Self {
         Value::U(v)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(v: i32) -> Self {
+        Value::I(v as i64)
+    }
+}
+
+impl From<u32> for Value {
+    fn from(v: u32) -> Self {
+        Value::U(v as u64)
     }
 }
 

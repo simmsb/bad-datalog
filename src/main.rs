@@ -4,9 +4,12 @@ use std::rc::Rc;
 
 use dlog::{
     datalog::*,
+    object,
     query::{QueryBuilder, RHS},
+    storage::Database,
 };
 use itertools::Itertools;
+use tempfile::tempdir;
 
 fn books() {
     let book_names = EphemerealRelation::<Rc<String>>::from_iter([
@@ -26,7 +29,8 @@ fn books() {
     let review_scores = EphemerealRelation::<u64>::from_iter([(0, 22), (1, 44), (2, 12), (3, 6)]);
 
     // review --> book
-    let review_books = EphemerealRelation::<u64>::from_iter([(0, 100), (1, 100), (2, 101), (3, 103)]);
+    let review_books =
+        EphemerealRelation::<u64>::from_iter([(0, 100), (1, 100), (2, 101), (3, 103)]);
 
     // let's do the query:
     //   ?b :book_name ?t
@@ -99,6 +103,55 @@ fn from_join_ex() {
 }
 
 fn test_query() {
+    let tmp = tempdir().unwrap();
+    let sled_db = sled::open(tmp.path()).unwrap();
+
+    let mut db = Database::from_sled(sled_db.clone());
+
+    let book_foo = db.add_object(&object!(
+        book_name: "foo",
+        book_price: 100,
+    ));
+
+    let book_bar = db.add_object(&object!(
+        book_name: "bar",
+        book_price: 100,
+    ));
+
+    let _book_baz = db.add_object(&object!(
+        book_name: "baz",
+        book_price: 100,
+    ));
+
+    let book_blah = db.add_object(&object!(
+        book_name: "blah",
+        book_price: 100,
+    ));
+
+    db.add_object(&object!(
+        review_book: book_foo,
+        review_user: "reviewer_0",
+        review_score: 10,
+    ));
+
+    db.add_object(&object!(
+        review_book: book_foo,
+        review_user: "reviewer_1",
+        review_score: 100,
+    ));
+
+    db.add_object(&object!(
+        review_book: book_bar,
+        review_user: "reviewer_0",
+        review_score: 102,
+    ));
+
+    db.add_object(&object!(
+        review_book: book_blah,
+        review_user: "reviewer_1",
+        review_score: 99,
+    ));
+
     let mut builder = QueryBuilder::default();
 
     let b = builder.binding();
@@ -137,6 +190,22 @@ fn test_query() {
 
     for op in &plan.opcodes {
         println!("{}", op);
+    }
+
+    let results = plan.execute(sled_db);
+
+    println!("results: {:?}", results);
+
+    for row in results {
+        println!(
+            "b: {}, p: {}, t: {}, r: {}, u: {}, s: {}",
+            row.fetch(b),
+            row.fetch(p),
+            row.fetch(t),
+            row.fetch(r),
+            row.fetch(u),
+            row.fetch(s),
+        )
     }
 }
 

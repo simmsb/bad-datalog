@@ -4,7 +4,7 @@ use itertools::Itertools;
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
-    datalog::{DBBackedRelation, Variable},
+    datalog::{any_changed, DBBackedRelation, Variable, VariableMeta},
     query::{Binding, QueryBuilder, QueryClause, RHS},
     storage::Value,
 };
@@ -13,9 +13,10 @@ use crate::{
 pub struct QueryPlan {
     pub binding_metas: HashMap<Binding, BindingMeta>,
     var_count: usize,
-    pub var_metas: HashMap<usize, VariableMeta>,
+    pub var_metas: HashMap<usize, VarMeta>,
     pub inversions: HashMap<&'static str, usize>,
     pub opcodes: Vec<OpCode>,
+    final_vid: usize,
     final_binding_positions: Vec<Option<usize>>,
 }
 
@@ -45,18 +46,15 @@ impl QueryPlan {
     fn metadata_visit_pattern(&mut self, lhs: Binding, _attr: &'static str, rhs: &RHS) {
         self.binding_metas.entry(lhs).or_default().onlhs = true;
 
-        match rhs {
-            RHS::Bnd(binding) => {
-                let meta = self.binding_metas.entry(*binding).or_default();
+        if let RHS::Bnd(binding) = rhs {
+            let meta = self.binding_metas.entry(*binding).or_default();
 
-                assert!(
-                    !meta.onrhs,
-                    "bindings cannot appear on the rhs twice yet (implicit equality constraints)"
-                );
+            assert!(
+                !meta.onrhs,
+                "bindings cannot appear on the rhs twice yet (implicit equality constraints)"
+            );
 
-                meta.onrhs = true;
-            }
-            _ => {}
+            meta.onrhs = true;
         }
     }
 }
@@ -174,8 +172,10 @@ impl QueryPlan {
 
                     let mut n = out_vmeta.binding_positions.len() as u8 - 1;
                     for b in inner_binding_positions.keys().cloned() {
-                        if !out_vmeta.binding_positions.contains_key(&b) {
-                            out_vmeta.binding_positions.insert(b, Some(n));
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            out_vmeta.binding_positions.entry(b)
+                        {
+                            e.insert(Some(n));
                             n += 1;
                         }
                     }
@@ -292,7 +292,7 @@ impl QueryPlan {
         let var_id = self.var_count;
         self.var_count += 1;
 
-        self.var_metas.insert(var_id, VariableMeta::new(type_));
+        self.var_metas.insert(var_id, VarMeta::new(type_));
 
         var_id
     }
@@ -319,6 +319,8 @@ impl QueryPlan {
 
         let meta = self.var_metas.get(&final_vid).unwrap();
 
+        self.final_vid = final_vid;
+
         self.final_binding_positions
             .resize(meta.binding_positions.len(), None);
 
@@ -328,6 +330,7 @@ impl QueryPlan {
     }
 }
 
+#[derive(Debug)]
 enum VarOrRel {
     Var(Variable<SmallVec<[Value; 8]>>),
     Rel(DBBackedRelation<Value>),
@@ -347,6 +350,20 @@ impl VarOrRel {
             _ => None,
         }
     }
+
+    fn into_var(self) -> Option<Variable<SmallVec<[Value; 8]>>> {
+        match self {
+            VarOrRel::Var(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    fn into_rel(self) -> Option<DBBackedRelation<Value>> {
+        match self {
+            VarOrRel::Rel(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 impl QueryPlan {
@@ -360,7 +377,7 @@ impl QueryPlan {
             })
             .collect_vec();
 
-        let _vars = things
+        let vars = things
             .iter()
             .filter_map(|x| match x {
                 VarOrRel::Var(v) => Some(v),
@@ -368,7 +385,32 @@ impl QueryPlan {
             })
             .collect_vec();
 
-        todo!()
+        for (name, dst_vid) in &self.inversions {
+            let var = things[*dst_vid].var().unwrap();
+
+            let rel = DBBackedRelation::<Value>::from_tree(db.open_tree(name).unwrap());
+            var.insert_data(
+                rel.into_iter()
+                    .map(|(k, v)| (v.u().unwrap(), SmallVec::from_elem(Value::U(k), 1))),
+            );
+        }
+
+        while any_changed(vars.iter().map(|v| *v as &dyn VariableMeta)) {
+            println!("{:#?}", things);
+
+            for op in &self.opcodes {
+                op.execute(&things);
+            }
+        }
+
+        let r = { things }
+            .remove(self.final_vid)
+            .into_var()
+            .unwrap()
+            .into_relation();
+        r.into_iter()
+            .map(|(idx, row)| ResultRow::from_rel_row(idx, row, &self.final_binding_positions))
+            .collect_vec()
     }
 }
 
@@ -379,7 +421,7 @@ enum VarType {
 }
 
 #[derive(Debug)]
-pub struct VariableMeta {
+pub struct VarMeta {
     type_: VarType,
     // the positions of bindings in this variable
     //
@@ -392,7 +434,7 @@ pub struct VariableMeta {
     binding_positions: HashMap<Binding, Option<u8>>,
 }
 
-impl VariableMeta {
+impl VarMeta {
     fn new(type_: VarType) -> Self {
         Self {
             type_,
@@ -610,13 +652,15 @@ impl OpCode {
                 let lhs_thing = &things[*lhs];
                 let rhs_thing = &things[*rhs];
 
+                println!("performing join of {} <> {} into {}", lhs, rhs, dst);
+
                 // hmmmm
                 match (lhs_thing, rhs_thing) {
                     (VarOrRel::Var(lhs), VarOrRel::Var(rhs)) => {
                         dst_var.from_join(lhs, rhs, |k, l, r| {
                             let mut out_v =
                                 SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
-                            out_v.resize_with(*out_len, || MaybeUninit::uninit());
+                            out_v.resize_with(*out_len, MaybeUninit::uninit);
 
                             let mut out_k = MaybeUninit::<u64>::uninit();
 
@@ -637,7 +681,7 @@ impl OpCode {
                         dst_var.from_join(lhs, rhs, |k, l, r| {
                             let mut out_v =
                                 SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
-                            out_v.resize_with(*out_len, || MaybeUninit::uninit());
+                            out_v.resize_with(*out_len, MaybeUninit::uninit);
 
                             let mut out_k = MaybeUninit::<u64>::uninit();
 
@@ -658,7 +702,7 @@ impl OpCode {
                         dst_var.from_join(lhs, rhs, |k, l, r| {
                             let mut out_v =
                                 SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
-                            out_v.resize_with(*out_len, || MaybeUninit::uninit());
+                            out_v.resize_with(*out_len, MaybeUninit::uninit);
 
                             let mut out_k = MaybeUninit::<u64>::uninit();
 
@@ -679,7 +723,7 @@ impl OpCode {
                         dst_var.from_join(lhs, rhs, |k, l, r| {
                             let mut out_v =
                                 SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
-                            out_v.resize_with(*out_len, || MaybeUninit::uninit());
+                            out_v.resize_with(*out_len, MaybeUninit::uninit);
 
                             let mut out_k = MaybeUninit::<u64>::uninit();
 
@@ -706,7 +750,7 @@ impl OpCode {
 pub struct ResultRow<'a> {
     idx_val: Value,
     inner: SmallVec<[Value; 8]>,
-    relocs: &'a Vec<Option<usize>>,
+    relocs: &'a [Option<usize>],
 }
 
 impl<'a> ResultRow<'a> {
@@ -715,6 +759,14 @@ impl<'a> ResultRow<'a> {
             &self.inner[idx]
         } else {
             &self.idx_val
+        }
+    }
+
+    fn from_rel_row(idx: u64, inner: SmallVec<[Value; 8]>, relocs: &'a [Option<usize>]) -> Self {
+        ResultRow {
+            idx_val: Value::U(idx),
+            inner,
+            relocs,
         }
     }
 }
