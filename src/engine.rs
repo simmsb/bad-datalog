@@ -4,7 +4,7 @@ use itertools::Itertools;
 use smallvec::{smallvec, SmallVec};
 
 use crate::{
-    datalog::{any_changed, DBBackedRelation, Relation, Variable, VariableMeta},
+    datalog::{any_changed, DBBackedRelation, Variable, VariableMeta},
     query::{Binding, QueryBuilder, QueryClause, RHS},
     storage::Value,
 };
@@ -146,22 +146,81 @@ impl QueryPlan {
                     self.var_for_attr(attr, lhs, *rhs_binding)
                 };
 
-                // TODO: we need to be aware of queries in the form:
-                //
-                // (?a :attr ?b)
-                // (?b :attr ?c)
-                //
-                // These don't join the ?b because it's used on the lhs *after*
-                // where it's used on the rhs
+                if let Some(previous_vid) = self.binding_metas.get(&lhs).unwrap().final_variable {
+                    // this binding has already been seen on the lhs or rhs, we
+                    // need to join it
 
-                if let Some(previous_lhs_vid) = self.binding_metas.get(&lhs).unwrap().final_variable
-                {
-                    // this binding has already been seen on the lhs, we need to
-                    // join it
+                    let was_on_lhs = self
+                        .var_metas
+                        .get(&previous_vid)
+                        .unwrap()
+                        .binding_positions
+                        .get(&lhs)
+                        .unwrap()
+                        .is_none();
+
+                    let lhs_vid = if was_on_lhs {
+                        previous_vid
+                    } else {
+                        // in this case the lhs variable was on the rhs the last
+                        // time it was seen, for example:
+                        //
+                        // ?e :review_book ?x
+                        // ?e :review_score ?s
+                        //
+                        // -- current query
+                        //
+                        // ?x :book_name ?n
+                        //
+                        // for this, we'll have (?e, (?x, ?s)) which we'll then
+                        // map into (?x, (?e, ?s)) so that it can then be joined
+                        // with (?x, ?n) resulting in (?x, (?e, ?s, ?n)) and
+                        // then we'll be done because we wanted the lhs to be ?x
+                        // anyway
+
+                        let mut prev_binding_positions = self
+                            .var_metas
+                            .get(&previous_vid)
+                            .unwrap()
+                            .binding_positions
+                            .clone();
+
+                        let prev_key = prev_binding_positions
+                            .iter()
+                            .filter(|(_k, v)| v.is_none())
+                            .map(|(k, _)| k)
+                            .next()
+                            .cloned()
+                            .unwrap();
+
+                        if let VarType::Relation(attr) =
+                            self.var_metas.get(&previous_vid).unwrap().type_
+                        {
+                            // for variables, we can just prep an inversion and use that
+
+                            self.add_inversion(attr, prev_key, lhs)
+                        } else {
+                            let new_key_pos =
+                                prev_binding_positions.get(&lhs).unwrap().expect("how???");
+                            prev_binding_positions.insert(lhs, None);
+                            prev_binding_positions.insert(prev_key, Some(new_key_pos));
+
+                            let inner_vid = self.new_var(VarType::Var);
+
+                            let inner_vmeta = self.var_metas.get_mut(&inner_vid).unwrap();
+                            inner_vmeta.binding_positions = prev_binding_positions;
+
+                            self.push_remap_op(inner_vid, previous_vid);
+
+                            // now we have (?x, (?e, ?s)) and want to join it with (?x, ?n)
+
+                            inner_vid
+                        }
+                    };
 
                     let previous_binding_positions = self
                         .var_metas
-                        .get(&previous_lhs_vid)
+                        .get(&lhs_vid)
                         .unwrap()
                         .binding_positions
                         .clone();
@@ -190,7 +249,7 @@ impl QueryPlan {
 
                     self.update_final_variables(out_vid);
 
-                    self.push_join_op(out_vid, previous_lhs_vid, inner_vid);
+                    self.push_join_op(out_vid, lhs_vid, inner_vid);
                 } else {
                     self.update_final_variables(inner_vid);
                 }
@@ -262,6 +321,33 @@ impl QueryPlan {
             lhs_fetch_method,
             rhs,
             rhs_fetch_method,
+            key_fetch_method,
+            out_len,
+        })
+    }
+
+    fn push_remap_op(&mut self, dst: usize, src: usize) {
+        let fetch_method = self.fetch_method_for(dst, src);
+
+        let key_binding = self.var_metas.get(&src).unwrap().key_binding();
+        let key_fetch_method = match self
+            .var_metas
+            .get(&dst)
+            .unwrap()
+            .binding_positions
+            .get(&key_binding)
+        {
+            Some(Some(n)) => ReadType::ToPosition(*n),
+            Some(None) => ReadType::AsIndex,
+            None => ReadType::Ignore,
+        };
+
+        let out_len = self.var_metas.get(&dst).unwrap().binding_positions.len() - 1;
+
+        self.opcodes.push(OpCode::Remap {
+            dst,
+            src,
+            fetch_method,
             key_fetch_method,
             out_len,
         })
@@ -401,6 +487,10 @@ impl QueryPlan {
                 rel.into_iter()
                     .map(|(k, v)| (v.u().unwrap(), SmallVec::from_elem(Value::U(k), 1))),
             );
+        }
+
+        for op in &self.opcodes {
+            op.execute(&things);
         }
 
         while any_changed(vars.iter().map(|v| *v as &dyn VariableMeta)) {
@@ -584,6 +674,13 @@ pub enum OpCode {
         key_fetch_method: ReadType,
         out_len: usize,
     },
+    Remap {
+        dst: usize,
+        src: usize,
+        fetch_method: FetchMethod,
+        key_fetch_method: ReadType,
+        out_len: usize,
+    },
 }
 
 impl Display for OpCode {
@@ -629,6 +726,22 @@ impl Display for OpCode {
                 format_fetchmethod(f, "l", lhs_fetch_method)?;
                 write!(f, "; ")?;
                 format_fetchmethod(f, "r", rhs_fetch_method)?;
+                write!(f, "; ")?;
+                match key_fetch_method {
+                    ReadType::Ignore => (),
+                    ReadType::AsIndex => write!(f, "{}.idx <- in.idx", dst)?,
+                    ReadType::ToPosition(n) => write!(f, "{}.{} <- in.idx", dst, n)?,
+                };
+            }
+            OpCode::Remap {
+                dst,
+                src,
+                fetch_method,
+                key_fetch_method,
+                out_len: _,
+            } => {
+                write!(f, "o:{} <- s:{} ", dst, src)?;
+                format_fetchmethod(f, "s", fetch_method)?;
                 write!(f, "; ")?;
                 match key_fetch_method {
                     ReadType::Ignore => (),
@@ -743,6 +856,42 @@ impl OpCode {
 
                             (out_k, out_v)
                         });
+                    }
+                }
+            }
+            OpCode::Remap {
+                dst,
+                src,
+                fetch_method,
+                key_fetch_method,
+                out_len,
+            } => {
+                let dst_var = things[*dst].var().unwrap();
+                let src_thing = &things[*src];
+
+                match src_thing {
+                    VarOrRel::Var(src) => {
+                        dst_var.from_map(src, |k, v| {
+                            let mut out_v =
+                                SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
+                            out_v.resize_with(*out_len, MaybeUninit::uninit);
+
+                            let mut out_k = MaybeUninit::<u64>::uninit();
+
+                            fetch_method.perform_on_row(v, &mut out_k, out_v.as_mut_slice());
+                            key_fetch_method.perform(Value::U(k), &mut out_k, out_v.as_mut_slice());
+
+                            let out_k = unsafe { out_k.assume_init() };
+                            let out_v = out_v
+                                .into_iter()
+                                .map(|x| unsafe { x.assume_init() })
+                                .collect();
+
+                            (out_k, out_v)
+                        });
+                    }
+                    VarOrRel::Rel(_) => {
+                        panic!("we should be planning inversions instead of remapping relations")
                     }
                 }
             }
