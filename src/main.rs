@@ -162,11 +162,11 @@ fn test_query() {
     let s = builder.binding();
 
     builder
-        .pattern(b, "book_name", RHS::Bnd(t))
-        .pattern(b, "book_price", RHS::Bnd(p))
         .pattern(r, "review_book", RHS::Bnd(b))
         .pattern(r, "review_user", RHS::Bnd(u))
-        .pattern(r, "review_score", RHS::Bnd(s));
+        .pattern(r, "review_score", RHS::Bnd(s))
+        .pattern(b, "book_name", RHS::Bnd(t))
+        .pattern(b, "book_price", RHS::Bnd(p));
 
     let plan = builder.plan();
 
