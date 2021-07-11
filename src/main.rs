@@ -158,12 +158,12 @@ fn test_query() {
     let p = builder.binding();
     let t = builder.binding();
     let r = builder.binding();
-    let u = builder.binding();
+    // let u = builder.binding();
     let s = builder.binding();
 
     builder
         .pattern(r, "review_book", RHS::Bnd(b))
-        .pattern(r, "review_user", RHS::Bnd(u))
+        .pattern(r, "review_user", RHS::Str("reviewer_0"))
         .pattern(r, "review_score", RHS::Bnd(s))
         .pattern(b, "book_name", RHS::Bnd(t))
         .pattern(b, "book_price", RHS::Bnd(p));
@@ -184,7 +184,7 @@ fn test_query() {
 
     println!("\nopcodes: ");
 
-    for (attr, vid) in &plan.inversions {
+    for (attr, vid) in &plan.pre_inversions {
         println!("{} <- {}", vid, attr);
     }
 
@@ -198,12 +198,11 @@ fn test_query() {
 
     for row in results {
         println!(
-            "b: {}, p: {}, t: {}, r: {}, u: {}, s: {}",
+            "b: {}, p: {}, t: {}, r: {}, s: {}",
             row.fetch(b),
             row.fetch(p),
             row.fetch(t),
             row.fetch(r),
-            row.fetch(u),
             row.fetch(s),
         )
     }

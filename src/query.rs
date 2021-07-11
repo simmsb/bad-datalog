@@ -10,7 +10,7 @@ pub struct Binding(pub(crate) usize);
 
 #[derive(Default, Debug)]
 pub struct QueryBuilder {
-    var_id: usize,
+    pub(crate) var_id: usize,
     // pub(crate) bindings: HashMap<Binding, BindingMeta>,
     pub(crate) clauses: Vec<QueryClause>,
 }
@@ -38,8 +38,9 @@ impl QueryBuilder {
 
 #[derive(Debug)]
 pub enum RHS {
-    Str(String),
-    Int(u64),
+    Str(&'static str),
+    UInt(u64),
+    IInt(i64),
     Bnd(Binding),
 }
 

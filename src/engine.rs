@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, mem::MaybeUninit};
+use std::{collections::HashMap, fmt::Display, mem::MaybeUninit, rc::Rc};
 
 use itertools::Itertools;
 use smallvec::{smallvec, SmallVec};
@@ -9,12 +9,13 @@ use crate::{
     storage::Value,
 };
 
-#[derive(Default, Debug)]
 pub struct QueryPlan {
     pub binding_metas: HashMap<Binding, BindingMeta>,
+    max_binding: usize,
     var_count: usize,
     pub var_metas: HashMap<usize, VarMeta>,
-    pub inversions: HashMap<&'static str, usize>,
+    pub pre_inversions: HashMap<&'static str, usize>,
+    pub pre_filters: Vec<(&'static str, usize, Box<dyn Fn(&Value) -> bool>)>,
     pub opcodes: Vec<OpCode>,
     final_vid: usize,
     final_binding_positions: Vec<Option<usize>>,
@@ -22,10 +23,27 @@ pub struct QueryPlan {
 
 impl QueryPlan {
     pub(crate) fn plan_for(query: &QueryBuilder) -> Self {
-        let mut plan = QueryPlan::default();
+        let mut plan = QueryPlan {
+            binding_metas: Default::default(),
+            max_binding: query.var_id,
+            var_count: 0,
+            var_metas: Default::default(),
+            pre_inversions: Default::default(),
+            pre_filters: Default::default(),
+            opcodes: Default::default(),
+            final_vid: 0,
+            final_binding_positions: Default::default(),
+        };
 
         plan.get_metadata(query);
         plan.generate_vars(query);
+
+        for i in 0..plan.max_binding {
+            if !plan.binding_metas.contains_key(&Binding(i)) {
+                panic!("Unused binding: {}", i);
+            }
+        }
+
         plan.insert_final_binding_positons();
 
         plan
@@ -103,7 +121,7 @@ impl QueryPlan {
                     // generate the inversion variable
                     //
                     // (?r, ?b) -> (?b, ?r)
-                    let inv_vid = self.add_inversion(attr, lhs, *rhs_binding);
+                    let inv_vid = self.add_preinversion(attr, lhs, *rhs_binding);
 
                     // generate the join with the rhs
                     //
@@ -146,124 +164,153 @@ impl QueryPlan {
                     self.var_for_attr(attr, lhs, *rhs_binding)
                 };
 
-                if let Some(previous_vid) = self.binding_metas.get(&lhs).unwrap().final_variable {
-                    // this binding has already been seen on the lhs or rhs, we
-                    // need to join it
-
-                    let was_on_lhs = self
-                        .var_metas
-                        .get(&previous_vid)
-                        .unwrap()
-                        .binding_positions
-                        .get(&lhs)
-                        .unwrap()
-                        .is_none();
-
-                    let lhs_vid = if was_on_lhs {
-                        previous_vid
-                    } else {
-                        // in this case the lhs variable was on the rhs the last
-                        // time it was seen, for example:
-                        //
-                        // ?e :review_book ?x
-                        // ?e :review_score ?s
-                        //
-                        // -- current query
-                        //
-                        // ?x :book_name ?n
-                        //
-                        // for this, we'll have (?e, (?x, ?s)) which we'll then
-                        // map into (?x, (?e, ?s)) so that it can then be joined
-                        // with (?x, ?n) resulting in (?x, (?e, ?s, ?n)) and
-                        // then we'll be done because we wanted the lhs to be ?x
-                        // anyway
-
-                        let mut prev_binding_positions = self
-                            .var_metas
-                            .get(&previous_vid)
-                            .unwrap()
-                            .binding_positions
-                            .clone();
-
-                        let prev_key = prev_binding_positions
-                            .iter()
-                            .filter(|(_k, v)| v.is_none())
-                            .map(|(k, _)| k)
-                            .next()
-                            .cloned()
-                            .unwrap();
-
-                        if let VarType::Relation(attr) =
-                            self.var_metas.get(&previous_vid).unwrap().type_
-                        {
-                            // for variables, we can just prep an inversion and use that
-
-                            self.add_inversion(attr, prev_key, lhs)
-                        } else {
-                            let new_key_pos =
-                                prev_binding_positions.get(&lhs).unwrap().expect("how???");
-                            prev_binding_positions.insert(lhs, None);
-                            prev_binding_positions.insert(prev_key, Some(new_key_pos));
-
-                            let inner_vid = self.new_var(VarType::Var);
-
-                            let inner_vmeta = self.var_metas.get_mut(&inner_vid).unwrap();
-                            inner_vmeta.binding_positions = prev_binding_positions;
-
-                            self.push_remap_op(inner_vid, previous_vid);
-
-                            // now we have (?x, (?e, ?s)) and want to join it with (?x, ?n)
-
-                            inner_vid
-                        }
-                    };
-
-                    let previous_binding_positions = self
-                        .var_metas
-                        .get(&lhs_vid)
-                        .unwrap()
-                        .binding_positions
-                        .clone();
-
-                    let inner_binding_positions = self
-                        .var_metas
-                        .get(&inner_vid)
-                        .unwrap()
-                        .binding_positions
-                        .clone();
-
-                    let out_vid = self.new_var(VarType::Var);
-                    let out_vmeta = self.var_metas.get_mut(&out_vid).unwrap();
-
-                    out_vmeta.binding_positions = previous_binding_positions;
-
-                    let mut n = out_vmeta.binding_positions.len() as u8 - 1;
-                    for b in inner_binding_positions.keys().cloned() {
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            out_vmeta.binding_positions.entry(b)
-                        {
-                            e.insert(Some(n));
-                            n += 1;
-                        }
-                    }
-
-                    self.update_final_variables(out_vid);
-
-                    self.push_join_op(out_vid, lhs_vid, inner_vid);
-                } else {
-                    self.update_final_variables(inner_vid);
-                }
+                self.do_join_with_previous(lhs, inner_vid);
             }
-            _ => todo!(),
+            x => {
+                let rhs = match x {
+                    RHS::Str(s) => Value::S(Rc::new(s.to_string())),
+                    RHS::UInt(i) => Value::U(*i),
+                    RHS::IInt(i) => Value::I(*i),
+                    _ => unreachable!(),
+                };
+
+                let fn_: Box<dyn Fn(&Value) -> bool> = Box::new(move |v| v == &rhs);
+
+                let vid = self.add_prefilter(attr, lhs, fn_);
+
+                self.do_join_with_previous(lhs, vid);
+            }
         }
     }
 
-    fn add_inversion(&mut self, src: &'static str, lhs: Binding, rhs: Binding) -> usize {
-        let inv_vid = if let Some(&vid) = self.inversions.get(src) {
+    fn do_join_with_previous(&mut self, lhs: Binding, inner_vid: usize) {
+        if let Some(previous_vid) = self.binding_metas.get(&lhs).unwrap().final_variable {
+            // this binding has already been seen on the lhs or rhs, we
+            // need to join it
+
+            let was_on_lhs = self
+                .var_metas
+                .get(&previous_vid)
+                .unwrap()
+                .binding_positions
+                .get(&lhs)
+                .unwrap()
+                .is_none();
+
+            let lhs_vid = if was_on_lhs {
+                previous_vid
+            } else {
+                // in this case the lhs variable was on the rhs the last
+                // time it was seen, for example:
+                //
+                // ?e :review_book ?x
+                // ?e :review_score ?s
+                //
+                // -- current query
+                //
+                // ?x :book_name ?n
+                //
+                // for this, we'll have (?e, (?x, ?s)) which we'll then
+                // map into (?x, (?e, ?s)) so that it can then be joined
+                // with (?x, ?n) resulting in (?x, (?e, ?s, ?n)) and
+                // then we'll be done because we wanted the lhs to be ?x
+                // anyway
+
+                let mut prev_binding_positions = self
+                    .var_metas
+                    .get(&previous_vid)
+                    .unwrap()
+                    .binding_positions
+                    .clone();
+
+                let prev_key = prev_binding_positions
+                    .iter()
+                    .filter(|(_k, v)| v.is_none())
+                    .map(|(k, _)| k)
+                    .next()
+                    .cloned()
+                    .unwrap();
+
+                if let VarType::Relation(attr) = self.var_metas.get(&previous_vid).unwrap().type_ {
+                    // for variables, we can just prep an inversion and use that
+
+                    self.add_preinversion(attr, prev_key, lhs)
+                } else {
+                    let new_key_pos = prev_binding_positions.get(&lhs).unwrap().expect("how???");
+                    prev_binding_positions.insert(lhs, None);
+                    prev_binding_positions.insert(prev_key, Some(new_key_pos));
+
+                    let inner_vid = self.new_var(VarType::Var);
+
+                    let inner_vmeta = self.var_metas.get_mut(&inner_vid).unwrap();
+                    inner_vmeta.binding_positions = prev_binding_positions;
+
+                    self.push_remap_op(inner_vid, previous_vid);
+
+                    // now we have (?x, (?e, ?s)) and want to join it with (?x, ?n)
+
+                    inner_vid
+                }
+            };
+
+            let previous_binding_positions = self
+                .var_metas
+                .get(&lhs_vid)
+                .unwrap()
+                .binding_positions
+                .clone();
+
+            let inner_binding_positions = self
+                .var_metas
+                .get(&inner_vid)
+                .unwrap()
+                .binding_positions
+                .clone();
+
+            let out_vid = self.new_var(VarType::Var);
+            let out_vmeta = self.var_metas.get_mut(&out_vid).unwrap();
+
+            out_vmeta.binding_positions = previous_binding_positions;
+
+            let mut n = out_vmeta.binding_positions.len() as u8 - 1;
+            for b in inner_binding_positions.keys().cloned() {
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    out_vmeta.binding_positions.entry(b)
+                {
+                    e.insert(Some(n));
+                    n += 1;
+                }
+            }
+
+            self.update_final_variables(out_vid);
+
+            self.push_join_op(out_vid, lhs_vid, inner_vid);
+        } else {
+            self.update_final_variables(inner_vid);
+        }
+    }
+
+    fn add_temp_binding(&mut self) -> Binding {
+        let id = self.max_binding;
+        self.max_binding += 1;
+        let binding = Binding(id);
+        self.binding_metas.insert(
+            binding,
+            BindingMeta {
+                onlhs: false,
+                onrhs: true,
+                final_variable: None,
+            },
+        );
+        binding
+    }
+
+    fn add_preinversion(&mut self, src: &'static str, lhs: Binding, rhs: Binding) -> usize {
+        let inv_vid = if let Some(&vid) = self.pre_inversions.get(src) {
             vid
         } else {
             let vid = self.new_var(VarType::Var);
-            self.inversions.insert(src, vid);
+            self.pre_inversions.insert(src, vid);
             vid
         };
 
@@ -272,6 +319,26 @@ impl QueryPlan {
         inv_vmeta.binding_positions.insert(lhs, Some(0));
 
         inv_vid
+    }
+
+    fn add_prefilter(
+        &mut self,
+        src: &'static str,
+        lhs: Binding,
+        fn_: Box<dyn Fn(&Value) -> bool>,
+    ) -> usize {
+        let vid = self.new_var(VarType::Var);
+        self.pre_filters.push((src, vid, fn_));
+
+        let tmp_rhs = self.add_temp_binding();
+
+        let vmeta = self.var_metas.get_mut(&vid).unwrap();
+        vmeta.binding_positions.insert(lhs, None);
+        vmeta.binding_positions.insert(tmp_rhs, Some(0));
+
+        self.binding_metas.get_mut(&tmp_rhs).unwrap().final_variable = Some(vid);
+
+        vid
     }
 
     /// update all the final variables of the bindings in the given variable to point to the variable
@@ -416,9 +483,12 @@ impl QueryPlan {
         self.final_vid = final_vid;
 
         self.final_binding_positions
-            .resize(meta.binding_positions.len(), None);
+            .resize(self.binding_metas.len(), None);
+
+        dbg!(self.binding_metas.len());
 
         for (binding, position) in &meta.binding_positions {
+            println!("{:?}, {:?}", binding, position);
             self.final_binding_positions[binding.0] = position.map(|idx| idx as usize);
         }
     }
@@ -479,13 +549,24 @@ impl QueryPlan {
             })
             .collect_vec();
 
-        for (name, dst_vid) in &self.inversions {
+        for (name, dst_vid) in &self.pre_inversions {
             let var = things[*dst_vid].var().unwrap();
 
             let rel = DBBackedRelation::<Value>::from_tree(db.open_tree(name).unwrap());
             var.insert_data(
                 rel.into_iter()
                     .map(|(k, v)| (v.u().unwrap(), SmallVec::from_elem(Value::U(k), 1))),
+            );
+        }
+
+        for (name, dst_vid, fn_) in &self.pre_filters {
+            let var = things[*dst_vid].var().unwrap();
+
+            let rel = DBBackedRelation::<Value>::from_tree(db.open_tree(name).unwrap());
+            var.insert_data(
+                rel.into_iter()
+                    .filter(|(_k, v)| fn_(v))
+                    .map(|(k, v)| (k, SmallVec::from_elem(v, 1))),
             );
         }
 
@@ -663,7 +744,6 @@ impl FetchMethod {
     }
 }
 
-#[derive(Debug)]
 pub enum OpCode {
     JoinInto {
         dst: usize,
@@ -680,6 +760,12 @@ pub enum OpCode {
         fetch_method: FetchMethod,
         key_fetch_method: ReadType,
         out_len: usize,
+    },
+    Filter {
+        dst: usize,
+        src: usize,
+        val_pos: Option<usize>,
+        fn_: Box<dyn Fn(&Value) -> bool>,
     },
 }
 
@@ -748,6 +834,14 @@ impl Display for OpCode {
                     ReadType::AsIndex => write!(f, "{}.idx <- in.idx", dst)?,
                     ReadType::ToPosition(n) => write!(f, "{}.{} <- in.idx", dst, n)?,
                 };
+            }
+            OpCode::Filter {
+                dst,
+                src,
+                val_pos,
+                fn_,
+            } => {
+                write!(f, "o:{} <- s:{} [{:?}] if {:p}", dst, src, val_pos, fn_)?;
             }
         }
 
@@ -891,7 +985,39 @@ impl OpCode {
                         });
                     }
                     VarOrRel::Rel(_) => {
-                        panic!("we should be planning inversions instead of remapping relations")
+                        panic!(
+                            "we should be planning pre-inversions instead of remapping relations"
+                        )
+                    }
+                }
+            }
+            OpCode::Filter {
+                dst,
+                src,
+                val_pos,
+                fn_,
+            } => {
+                let dst_var = things[*dst].var().unwrap();
+                let src_thing = &things[*src];
+
+                match src_thing {
+                    VarOrRel::Var(src) => {
+                        dst_var.from_filter(src, |k, v| {
+                            let keep = if let Some(idx) = val_pos {
+                                fn_(&v[*idx])
+                            } else {
+                                fn_(&Value::U(k))
+                            };
+
+                            if keep {
+                                Some((k, v.clone()))
+                            } else {
+                                None
+                            }
+                        });
+                    }
+                    VarOrRel::Rel(_) => {
+                        panic!("we should be planning pre-filters instead of filtering relations")
                     }
                 }
             }

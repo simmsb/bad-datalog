@@ -355,6 +355,21 @@ impl<T: Clone + Ord + 'static> Variable<T> {
         join_into_rel(lhs, rhs, self, logic);
     }
 
+    pub fn from_filter<U, F>(&self, input: &Variable<U>, mut logic: F)
+    where
+        U: Clone + 'static,
+        F: FnMut(u64, &U) -> Option<(u64, T)>,
+    {
+        self.insert(
+            input
+                .recent
+                .borrow()
+                .iter()
+                .filter_map(|(idx, v)| logic(idx, &v))
+                .collect(),
+        );
+    }
+
     pub fn from_map<U, F>(&self, input: &Variable<U>, mut logic: F)
     where
         U: Clone + 'static,
