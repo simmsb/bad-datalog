@@ -61,6 +61,20 @@ impl Value {
             _ => None,
         }
     }
+
+    pub fn i(self) -> Option<i64> {
+        match self {
+            Value::I(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    pub fn s(self) -> Option<Rc<String>> {
+        match self {
+            Value::S(s) => Some(s),
+            _ => None,
+        }
+    }
 }
 
 impl From<String> for Value {
