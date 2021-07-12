@@ -115,17 +115,17 @@ fn test_query() {
 
     let book_bar = db.add_object(&object!(
         book_name: "bar",
-        book_price: 100,
+        book_price: 101,
     ));
 
     let _book_baz = db.add_object(&object!(
         book_name: "baz",
-        book_price: 100,
+        book_price: 102,
     ));
 
     let book_blah = db.add_object(&object!(
         book_name: "blah",
-        book_price: 100,
+        book_price: 103,
     ));
 
     db.add_object(&object!(
@@ -166,7 +166,9 @@ fn test_query() {
         .pattern(r, "review_user", RHS::Str("reviewer_0"))
         .pattern(r, "review_score", RHS::Bnd(s))
         .pattern(b, "book_name", RHS::Bnd(t))
-        .pattern(b, "book_price", RHS::Bnd(p));
+        .pattern(b, "book_price", RHS::Bnd(p))
+        .filter(p, |p_v| p_v.i().unwrap() > 100)
+        ;
 
     let plan = builder.plan();
 

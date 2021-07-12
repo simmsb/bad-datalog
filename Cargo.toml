@@ -16,3 +16,4 @@ serde = { version = "1.0.126", features = ["rc", "derive"] }
 sled = "0.34.6"
 smallvec = "1.6.1"
 tempfile = "3.2.0"
+tuple = "0.5.1"

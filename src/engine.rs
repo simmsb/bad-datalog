@@ -5,7 +5,7 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     datalog::{any_changed, DBBackedRelation, Variable, VariableMeta},
-    query::{Binding, QueryBuilder, QueryClause, RHS},
+    query::{AsFilter, Binding, QueryBuilder, QueryClause, RHS},
     storage::Value,
 };
 
@@ -36,7 +36,7 @@ impl QueryPlan {
         };
 
         plan.get_metadata(query);
-        plan.generate_vars(query);
+        plan.construct_plan(query);
 
         for i in 0..plan.max_binding {
             if !plan.binding_metas.contains_key(&Binding(i)) {
@@ -53,10 +53,8 @@ impl QueryPlan {
 impl QueryPlan {
     fn get_metadata(&mut self, query: &QueryBuilder) {
         for clause in &query.clauses {
-            match clause {
-                QueryClause::Pattern(lhs, attr, rhs) => {
-                    self.metadata_visit_pattern(*lhs, attr, rhs);
-                }
+            if let QueryClause::Pattern(lhs, attr, rhs) = clause {
+                self.metadata_visit_pattern(*lhs, attr, rhs);
             }
         }
     }
@@ -78,14 +76,44 @@ impl QueryPlan {
 }
 
 impl QueryPlan {
-    fn generate_vars(&mut self, query: &QueryBuilder) {
+    fn construct_plan(&mut self, query: &QueryBuilder) {
         for clause in &query.clauses {
             match clause {
                 QueryClause::Pattern(lhs, attr, rhs) => {
                     self.vars_visit_pattern(*lhs, attr, rhs);
                 }
+                QueryClause::Filter(asfilter) => {
+                    self.process_filter(asfilter.as_ref());
+                }
             }
         }
+    }
+
+    fn process_filter(&mut self, filter: &dyn AsFilter) {
+        let src_vid = self.latest_vid_with(&filter.bindings());
+        let positions = self.binding_positions_for(src_vid);
+
+        let fn_ = filter.as_filter(&positions);
+
+        let dst_vid = self.new_var(VarType::Var);
+
+        let binding_positions = self
+            .var_metas
+            .get(&src_vid)
+            .unwrap()
+            .binding_positions
+            .clone();
+
+        let meta = self.var_metas.get_mut(&dst_vid).unwrap();
+        meta.binding_positions = binding_positions;
+
+        self.opcodes.push(OpCode::Filter {
+            dst: dst_vid,
+            src: src_vid,
+            fn_,
+        });
+
+        self.update_final_variables(dst_vid);
     }
 
     fn vars_visit_pattern(&mut self, lhs: Binding, attr: &'static str, rhs: &RHS) {
@@ -459,7 +487,44 @@ impl QueryPlan {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum PositionOf {
+    NotHere,
+    Index,
+    Position(u8),
+}
+
 impl QueryPlan {
+    fn latest_vid_with(&self, required: &[Binding]) -> usize {
+        let vid = self
+            .binding_metas
+            .get(&required[0])
+            .unwrap()
+            .final_variable
+            .expect("binding has not been seen yet");
+        let meta = self.var_metas.get(&vid).unwrap();
+
+        for b in required {
+            if !meta.binding_positions.contains_key(b) {
+                panic!("cannot create a filter for {:?} satisfying every variable at the current position", required);
+            }
+        }
+
+        vid
+    }
+
+    fn binding_positions_for(&self, vid: usize) -> Vec<PositionOf> {
+        let meta = self.var_metas.get(&vid).unwrap();
+
+        let mut positions = vec![PositionOf::NotHere; meta.binding_positions.len()];
+
+        for (binding, position) in &meta.binding_positions {
+            positions[binding.0] = position.map_or(PositionOf::Index, PositionOf::Position);
+        }
+
+        positions
+    }
+
     fn insert_final_binding_positons(&mut self) {
         if !self
             .binding_metas
@@ -485,10 +550,7 @@ impl QueryPlan {
         self.final_binding_positions
             .resize(self.binding_metas.len(), None);
 
-        dbg!(self.binding_metas.len());
-
         for (binding, position) in &meta.binding_positions {
-            println!("{:?}, {:?}", binding, position);
             self.final_binding_positions[binding.0] = position.map(|idx| idx as usize);
         }
     }
@@ -764,8 +826,7 @@ pub enum OpCode {
     Filter {
         dst: usize,
         src: usize,
-        val_pos: Option<usize>,
-        fn_: Box<dyn Fn(&Value) -> bool>,
+        fn_: Box<dyn for<'a> Fn(u64, &'a [Value]) -> bool>,
     },
 }
 
@@ -835,13 +896,8 @@ impl Display for OpCode {
                     ReadType::ToPosition(n) => write!(f, "{}.{} <- in.idx", dst, n)?,
                 };
             }
-            OpCode::Filter {
-                dst,
-                src,
-                val_pos,
-                fn_,
-            } => {
-                write!(f, "o:{} <- s:{} [{:?}] if {:p}", dst, src, val_pos, fn_)?;
+            OpCode::Filter { dst, src, fn_ } => {
+                write!(f, "o:{} <- s:{} if {:p}", dst, src, fn_)?;
             }
         }
 
@@ -991,25 +1047,14 @@ impl OpCode {
                     }
                 }
             }
-            OpCode::Filter {
-                dst,
-                src,
-                val_pos,
-                fn_,
-            } => {
+            OpCode::Filter { dst, src, fn_ } => {
                 let dst_var = things[*dst].var().unwrap();
                 let src_thing = &things[*src];
 
                 match src_thing {
                     VarOrRel::Var(src) => {
                         dst_var.from_filter(src, |k, v| {
-                            let keep = if let Some(idx) = val_pos {
-                                fn_(&v[*idx])
-                            } else {
-                                fn_(&Value::U(k))
-                            };
-
-                            if keep {
+                            if fn_(k, v) {
                                 Some((k, v.clone()))
                             } else {
                                 None
