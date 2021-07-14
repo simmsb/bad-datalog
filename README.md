@@ -10,13 +10,14 @@ support for file-backed databases.
 
 ## Example
 
-``` rust
+```rust
+use dlog::{Database, QueryBuilder, RHS, object};
+use tempfile::tempdir;
+
 let tmp = tempdir().unwrap();
 let sled_db = sled::open(tmp.path()).unwrap();
 
 let mut db = Database::from_sled(sled_db.clone());
-
-// add some data
 
 let book_foo = db.add_object(&object!(
     book_name: "foo",
@@ -25,17 +26,17 @@ let book_foo = db.add_object(&object!(
 
 let book_bar = db.add_object(&object!(
     book_name: "bar",
-    book_price: 100,
+    book_price: 101,
 ));
 
 let _book_baz = db.add_object(&object!(
     book_name: "baz",
-    book_price: 100,
+    book_price: 102,
 ));
 
 let book_blah = db.add_object(&object!(
     book_name: "blah",
-    book_price: 100,
+    book_price: 103,
 ));
 
 db.add_object(&object!(
@@ -62,41 +63,35 @@ db.add_object(&object!(
     review_score: 99,
 ));
 
-// put together a query
-
 let mut builder = QueryBuilder::default();
 
 let b = builder.binding();
 let p = builder.binding();
 let t = builder.binding();
 let r = builder.binding();
-let u = builder.binding();
 let s = builder.binding();
 
 builder
+    .pattern(r, "review_book", RHS::Bnd(b))
+    .pattern(r, "review_user", RHS::Str("reviewer_0"))
+    .pattern(r, "review_score", RHS::Bnd(s))
     .pattern(b, "book_name", RHS::Bnd(t))
     .pattern(b, "book_price", RHS::Bnd(p))
-    .pattern(r, "review_book", RHS::Bnd(b))
-    .pattern(r, "review_user", RHS::Bnd(u))
-    .pattern(r, "review_score", RHS::Bnd(s));
+    .filter(p, |p_v| p_v.i().unwrap() > 100)
+    ;
 
 let plan = builder.plan();
-let results = plan.execute(sled_db);
 
 for row in results {
     println!(
-        "b: {}, p: {}, t: {}, r: {}, u: {}, s: {}",
+        "b: {}, p: {}, t: {}, r: {}, s: {}",
         row.fetch(b),
         row.fetch(p),
         row.fetch(t),
         row.fetch(r),
-        row.fetch(u),
         row.fetch(s),
     )
 }
 
-// b: 0, p: 100, t: foo, r: 4, u: reviewer_0, s: 10
-// b: 0, p: 100, t: foo, r: 5, u: reviewer_1, s: 100
-// b: 1, p: 100, t: bar, r: 6, u: reviewer_0, s: 102
-// b: 3, p: 100, t: blah, r: 7, u: reviewer_1, s: 99
+// b: 1, p: 101, t: bar, r: 6, s: 102
 ```

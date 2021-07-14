@@ -7,3 +7,6 @@ pub mod datalog;
 pub mod query;
 pub mod engine;
 pub mod storage;
+
+pub use query::{QueryBuilder, RHS};
+pub use storage::Database;
