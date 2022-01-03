@@ -19,7 +19,9 @@ use std::{
 ///
 /// either in memory, or backed by a sled database
 pub trait Relation<T: Clone + 'static> {
-    type Iter<'a>: Iterator<Item = (u64, Cow<'a, T>)>;
+    type Iter<'a>: Iterator<Item = (u64, Cow<'a, T>)>
+    where
+        Self: 'a;
 
     fn is_empty(&self) -> bool;
     fn range(&self) -> RangeInclusive<u64>;
@@ -333,7 +335,7 @@ impl<T: Clone + Ord + 'static> Variable<T> {
         self.insert(EphemerealRelation::from_iter(it))
     }
 
-    pub fn from_join<U, V, R, F, RR>(&self, lhs: &Variable<U>, rhs: R, logic: F)
+    pub fn from_join<U, V, R, F, RR>(&self, lhs: &Variable<U>, rhs: R, logic: F) -> usize
     where
         U: Clone + Ord + 'static,
         V: Clone + 'static,
@@ -341,10 +343,10 @@ impl<T: Clone + Ord + 'static> Variable<T> {
         RR: Relation<V>,
         F: FnMut(u64, &U, &V) -> (u64, T),
     {
-        join_into(lhs, rhs, self, logic);
+        join_into(lhs, rhs, self, logic)
     }
 
-    pub fn from_join_rel<U, V, L, R, F>(&self, lhs: &L, rhs: &R, logic: F)
+    pub fn from_join_rel<U, V, L, R, F>(&self, lhs: &L, rhs: &R, logic: F) -> usize
     where
         U: Clone + Ord + 'static,
         V: Clone + 'static,
@@ -352,37 +354,40 @@ impl<T: Clone + Ord + 'static> Variable<T> {
         R: Relation<V>,
         F: FnMut(u64, &U, &V) -> (u64, T),
     {
-        join_into_rel(lhs, rhs, self, logic);
+        join_into_rel(lhs, rhs, self, logic)
     }
 
-    pub fn from_filter<U, F>(&self, input: &Variable<U>, mut logic: F)
+    pub fn from_filter<U, F>(&self, input: &Variable<U>, mut logic: F) -> usize
     where
         U: Clone + 'static,
         F: FnMut(u64, &U) -> Option<(u64, T)>,
     {
-        self.insert(
-            input
-                .recent
-                .borrow()
-                .iter()
-                .filter_map(|(idx, v)| logic(idx, &v))
-                .collect(),
-        );
+        let filtered: EphemerealRelation<T> = input
+            .recent
+            .borrow()
+            .iter()
+            .filter_map(|(idx, v)| logic(idx, &v))
+            .collect();
+        let num = filtered.elements.len();
+        self.insert(filtered);
+
+        num
     }
 
-    pub fn from_map<U, F>(&self, input: &Variable<U>, mut logic: F)
+    pub fn from_map<U, F>(&self, input: &Variable<U>, mut logic: F) -> usize
     where
         U: Clone + 'static,
         F: FnMut(u64, &U) -> (u64, T),
     {
-        self.insert(
-            input
-                .recent
-                .borrow()
-                .iter()
-                .map(|(idx, v)| logic(idx, &v))
-                .collect(),
-        );
+        let mapped: EphemerealRelation<T> = input
+            .recent
+            .borrow()
+            .iter()
+            .map(|(idx, v)| logic(idx, &v))
+            .collect();
+        let num = mapped.elements.len();
+        self.insert(mapped);
+        num
     }
 
     pub fn into_relation(self) -> EphemerealRelation<T> {
@@ -511,7 +516,7 @@ where
     }
 }
 
-fn join_into<T, U, V, R, F, RR>(lhs: &Variable<T>, rhs: R, out: &Variable<V>, mut logic: F)
+fn join_into<T, U, V, R, F, RR>(lhs: &Variable<T>, rhs: R, out: &Variable<V>, mut logic: F) -> usize
 where
     T: Clone + Ord + 'static,
     U: Clone + 'static,
@@ -544,10 +549,13 @@ where
         });
     }
 
+    let num = results.len();
     out.insert(EphemerealRelation::from_iter(results));
+
+    num
 }
 
-fn join_into_rel<T, U, V, L, R, F>(lhs: &L, rhs: &R, out: &Variable<V>, mut logic: F)
+fn join_into_rel<T, U, V, L, R, F>(lhs: &L, rhs: &R, out: &Variable<V>, mut logic: F) -> usize
 where
     T: Clone + Ord + 'static,
     U: Clone + 'static,
@@ -562,7 +570,10 @@ where
         results.push(logic(k, l, r));
     });
 
+    let num = results.len();
     out.insert(EphemerealRelation::from_iter(results));
+
+    num
 }
 
 pub trait VariableMeta {

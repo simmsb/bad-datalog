@@ -146,6 +146,18 @@ fn test_query() {
         review_score: 99,
     ));
 
+    for _  in 0..10000 {
+        let book = db.add_object(&object!(
+            book_name: "some random book",
+            book_price: 999,
+        ));
+        db.add_object(&object!(
+            review_book: book,
+            review_user: "reviewer n",
+            review_score: 99,
+        ));
+    }
+
     let mut builder = QueryBuilder::default();
 
     let b = builder.binding();
@@ -188,9 +200,10 @@ fn test_query() {
         println!("{}", op);
     }
 
-    let results = plan.execute(sled_db);
+    let (results, stats) = plan.execute(sled_db);
 
     println!("results: {:?}", results);
+    println!("stats: {:?}", stats);
 
     for row in results {
         println!(
