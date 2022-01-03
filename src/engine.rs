@@ -356,6 +356,8 @@ impl QueryPlan {
         fn_: Box<dyn Fn(&Value) -> bool>,
     ) -> usize {
         let vid = self.new_var(VarType::Var);
+        // TODO: we can improve this quite a lot by having an option for range
+        // prefilters that take advantage of the orderedness of data
         self.pre_filters.push((src, vid, fn_));
 
         let tmp_rhs = self.add_temp_binding();
@@ -593,7 +595,8 @@ impl VarOrRel {
 }
 
 impl QueryPlan {
-    pub fn execute(&self, db: sled::Db) -> Vec<ResultRow> {
+    pub fn execute(&self, db: sled::Db) -> (Vec<ResultRow>, ExecutionStats) {
+        let mut execution_stats = ExecutionStats::default();
         let things = (0..self.var_count)
             .map(|vid| match self.var_metas.get(&vid).unwrap().type_ {
                 VarType::Var => VarOrRel::Var(Variable::<SmallVec<[Value; 8]>>::new()),
@@ -633,12 +636,14 @@ impl QueryPlan {
         }
 
         for op in &self.opcodes {
-            op.execute(&things);
+            let s = op.execute(&things);
+            execution_stats = execution_stats.combine(s);
         }
 
         while any_changed(vars.iter().map(|v| *v as &dyn VariableMeta)) {
             for op in &self.opcodes {
-                op.execute(&things);
+                let s = op.execute(&things);
+                execution_stats = execution_stats.combine(s);
             }
         }
 
@@ -647,9 +652,12 @@ impl QueryPlan {
             .into_var()
             .unwrap()
             .into_relation();
-        r.into_iter()
+        let r = r
+            .into_iter()
             .map(|(idx, row)| ResultRow::from_rel_row(idx, row, &self.final_binding_positions))
-            .collect_vec()
+            .collect_vec();
+
+        (r, execution_stats)
     }
 }
 
@@ -905,9 +913,23 @@ impl Display for OpCode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecutionStats {
+    pub ops_performed: usize,
+}
+
+impl ExecutionStats {
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        Self {
+            ops_performed: self.ops_performed + other.ops_performed,
+        }
+    }
+}
+
 impl OpCode {
-    fn execute(&self, things: &[VarOrRel]) {
-        match self {
+    fn execute(&self, things: &[VarOrRel]) -> ExecutionStats {
+        let ops_performed = match self {
             OpCode::JoinInto {
                 dst,
                 lhs,
@@ -942,7 +964,7 @@ impl OpCode {
                                 .collect();
 
                             (out_k, out_v)
-                        });
+                        })
                     }
                     (VarOrRel::Var(lhs), VarOrRel::Rel(rhs)) => {
                         dst_var.from_join(lhs, rhs, |k, l, r| {
@@ -963,7 +985,7 @@ impl OpCode {
                                 .collect();
 
                             (out_k, out_v)
-                        });
+                        })
                     }
                     (VarOrRel::Rel(lhs), VarOrRel::Var(rhs)) => {
                         dst_var.from_join(rhs, lhs, |k, l, r| {
@@ -984,7 +1006,7 @@ impl OpCode {
                                 .collect();
 
                             (out_k, out_v)
-                        });
+                        })
                     }
                     (VarOrRel::Rel(lhs), VarOrRel::Rel(rhs)) => {
                         dst_var.from_join_rel(lhs, rhs, |k, l, r| {
@@ -1005,7 +1027,7 @@ impl OpCode {
                                 .collect();
 
                             (out_k, out_v)
-                        });
+                        })
                     }
                 }
             }
@@ -1020,26 +1042,24 @@ impl OpCode {
                 let src_thing = &things[*src];
 
                 match src_thing {
-                    VarOrRel::Var(src) => {
-                        dst_var.from_map(src, |k, v| {
-                            let mut out_v =
-                                SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
-                            out_v.resize_with(*out_len, MaybeUninit::uninit);
+                    VarOrRel::Var(src) => dst_var.from_map(src, |k, v| {
+                        let mut out_v =
+                            SmallVec::<[MaybeUninit<Value>; 8]>::with_capacity(*out_len);
+                        out_v.resize_with(*out_len, MaybeUninit::uninit);
 
-                            let mut out_k = MaybeUninit::<u64>::uninit();
+                        let mut out_k = MaybeUninit::<u64>::uninit();
 
-                            fetch_method.perform_on_row(v, &mut out_k, out_v.as_mut_slice());
-                            key_fetch_method.perform(Value::U(k), &mut out_k, out_v.as_mut_slice());
+                        fetch_method.perform_on_row(v, &mut out_k, out_v.as_mut_slice());
+                        key_fetch_method.perform(Value::U(k), &mut out_k, out_v.as_mut_slice());
 
-                            let out_k = unsafe { out_k.assume_init() };
-                            let out_v = out_v
-                                .into_iter()
-                                .map(|x| unsafe { x.assume_init() })
-                                .collect();
+                        let out_k = unsafe { out_k.assume_init() };
+                        let out_v = out_v
+                            .into_iter()
+                            .map(|x| unsafe { x.assume_init() })
+                            .collect();
 
-                            (out_k, out_v)
-                        });
-                    }
+                        (out_k, out_v)
+                    }),
                     VarOrRel::Rel(_) => {
                         panic!(
                             "we should be planning pre-inversions instead of remapping relations"
@@ -1052,21 +1072,21 @@ impl OpCode {
                 let src_thing = &things[*src];
 
                 match src_thing {
-                    VarOrRel::Var(src) => {
-                        dst_var.from_filter(src, |k, v| {
-                            if fn_(k, v) {
-                                Some((k, v.clone()))
-                            } else {
-                                None
-                            }
-                        });
-                    }
+                    VarOrRel::Var(src) => dst_var.from_filter(src, |k, v| {
+                        if fn_(k, v) {
+                            Some((k, v.clone()))
+                        } else {
+                            None
+                        }
+                    }),
                     VarOrRel::Rel(_) => {
                         panic!("we should be planning pre-filters instead of filtering relations")
                     }
                 }
             }
-        }
+        };
+
+        ExecutionStats { ops_performed }
     }
 }
 
